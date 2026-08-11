@@ -4,19 +4,21 @@
 
 **Goal:** Headless-ядро happy_tandemista: из папки с файлами прыжка (handcam/outside/интервью/приземление) построить таймлайн фаз по телеметрии+аудио+CV и отрендерить три варианта монтажа (full 16:9, emotions 16:9, highlights 9:16) через CLI.
 
-**Architecture:** Чистый Python-пакет `tandemista.engine` без БД и сети (кроме CV-адаптера к Claude API). Конвейер: извлечение сигналов (GPMF-телеметрия, аудио-RMS, CV-разметка) → детект фаз → фьюжн в общий таймлайн → EDL по декларативным шаблонам → ffmpeg-рендер. CLI связывает всё. Облачный каркас (FastAPI/Celery) подключит этот пакет в следующем плане.
+**Architecture:** Чистый Python-пакет `tandemista.engine` без БД и без сети — весь анализ, включая CV, идёт локально. Конвейер: извлечение сигналов (GPMF-телеметрия, аудио-RMS, CV-разметка) → детект фаз → фьюжн в общий таймлайн → EDL по декларативным шаблонам → ffmpeg-рендер. CLI связывает всё. Облачный каркас (FastAPI/Celery) подключит этот пакет в следующем плане.
 
-**Tech Stack:** Python 3.12+, numpy, anthropic (CV-адаптер), pytest; системные ffmpeg/ffprobe. Полная спека: `docs/superpowers/specs/2026-08-11-happy-tandemista-design.md`.
+**Tech Stack:** Python 3.12+, numpy, opencv-python-headless (свой CV), pytest; системные ffmpeg/ffprobe. Полная спека: `docs/superpowers/specs/2026-08-11-happy-tandemista-design.md`.
 
 ## Global Constraints
 
-- Python ≥ 3.12; зависимости backend только: `numpy`, `anthropic`, dev: `pytest` (новые — только через обсуждение).
+- Python ≥ 3.12; зависимости backend только: `numpy`, `opencv-python-headless`, dev: `pytest` (новые — только через обсуждение).
 - `ffmpeg` и `ffprobe` должны быть в PATH; проверять через `shutil.which` с понятной ошибкой.
 - Код, имена и комментарии — на английском; тексты для пользователей — позже, не в этом плане.
 - Все публичные функции — с type hints; dataclasses — `frozen=True` где нет мутаций.
 - Коммиты — conventional commits (`feat:`, `test:`, `chore:`).
 - Времена в сигналах и фазах — секунды `float` от начала файла; общий таймлайн — секунды от общего нуля прыжка.
-- CV-модель: `claude-sonnet-5`; при реализации Task 8 свериться со скиллом `claude-api` (актуальные параметры vision-запросов).
+- **CV — свой локальный конвейер, БЕЗ вызовов LLM на инференсе** (требование пользователя). Никаких обращений к vision-API из кода анализа; `anthropic` из зависимостей уходит.
+- CV-инференс CPU-first: модели лёгкие, GPU не требуется.
+- Веса моделей НЕ хранятся в git: качаются скриптом `backend/scripts/fetch_models.py` в `backend/models/` (папка в .gitignore). Тесты, требующие весов, скипаются при их отсутствии.
 - Тесты, требующие реальных съёмок GoPro, ищут файлы в `backend/tests/samples/` и скипаются, если их нет (`pytest.mark.skipif`).
 
 ---
@@ -35,7 +37,8 @@ backend/
       synthetic.py   # генератор синтетических сигналов прыжка (для тестов и демо)
       media.py       # обёртки ffmpeg/ffprobe: длительность, извлечение аудио, кадров, gpmd-потока
       gpmf.py        # минимальный KLV-парсер GPMF, GPS5 → SignalSeries
-      cv.py          # CVAnnotator (Protocol), ClaudeVisionAnnotator, типы CVAnnotation/Moment
+      frames.py      # FrameFeatures, extract_frame_features (OpenCV, без весов)
+      cv.py          # CVAnnotator (Protocol), LocalCVAnnotator, эвристики фаз/моментов, типы
       timeline.py    # SourceFile, JumpTimeline, build_timeline (фьюжн)
       templates.py   # Slot, Template, три встроенных шаблона
       edl.py         # Clip, EDL, generate_edl
@@ -66,7 +69,7 @@ backend/
 name = "tandemista"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["numpy>=1.26", "anthropic>=0.40"]
+dependencies = ["numpy>=1.26", "opencv-python-headless>=4.10"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
@@ -919,113 +922,312 @@ git commit -m "feat: minimal GPMF parser and GoPro telemetry extraction"
 
 ---
 
-### Task 8: CV-аннотатор (интерфейс + адаптер Claude Vision)
+### Task 8: Кадровые признаки без весов (frames.py)
 
-Перед реализацией свериться со скиллом `claude-api` (актуальный формат vision-запросов и model id).
+Заменяет прежний Task 8 (адаптер Claude Vision), отменённый решением пользователя «своя CV-модель, без LLM на инференсе». Это фундамент собственного CV: числовые признаки каждого кадра, из которых дальше строятся фазы и моменты. Работает на голом OpenCV, без единого файла весов, поэтому полностью тестируется в CI.
 
 **Files:**
-- Create: `backend/tandemista/engine/cv.py`
-- Test: `backend/tests/engine/test_cv.py`
+- Create: `backend/tandemista/engine/frames.py`
+- Test: `backend/tests/engine/test_frames.py`
+- Modify: `backend/pyproject.toml` (в `dependencies` добавить `opencv-python-headless>=4.10`, удалить `anthropic`)
 
 **Interfaces:**
-- Consumes: `extract_frames` (Task 5), `PhaseName`/`Phase` (Task 4).
+- Consumes: ничего из движка (только OpenCV и numpy).
 - Produces:
-  - `Moment(t: float, score: float, kind: str)` — kind: `"emotion" | "exit" | "deployment" | "scenic"`.
-  - `CVAnnotation(phases: list[Phase], moments: list[Moment])` (source фаз = `"cv"`, confidence 0.7).
-  - `CVAnnotator` (Protocol) c методом `annotate(video: Path) -> CVAnnotation`.
-  - `ClaudeVisionAnnotator(client: object | None = None, model: str = "claude-sonnet-5", fps: float = 0.5)` — извлекает кадры, шлёт батчами до 20 кадров с промптом, требующим строгий JSON `{"frames": [{"t": 0, "phase": "freefall", "emotion": 0.8, "notable": "exit"}]}`, склеивает соседние кадры одной фазы в `Phase`, кадры с `emotion >= 0.6` или `notable` — в `Moment`. Клиент инжектится для тестов (fake), по умолчанию — `anthropic.Anthropic()`.
+  - `FrameFeatures(t: float, sharpness: float, motion: float, brightness: float, sky_ratio: float)` — frozen dataclass. `t` — секунды от начала файла; `sharpness` — дисперсия лапласиана (безразмерная, больше = резче); `motion` — средняя магнитуда оптического потока к предыдущему сэмплированному кадру в пикселях уменьшенного кадра (у первого кадра 0.0); `brightness` — средняя яркость 0..1; `sky_ratio` — доля пикселей, похожих на небо, 0..1.
+  - `extract_frame_features(video: Path, fps: float = 0.5, width: int = 320) -> list[FrameFeatures]` — читает видео через OpenCV, сэмплирует с шагом `1/fps`, уменьшает кадр до ширины `width` (сохраняя пропорции) и считает признаки. Пустой список, если видео не открывается или пусто.
 
-- [ ] **Step 1: Падающий тест** (fake-клиент, сеть не нужна)
+- [ ] **Step 1: Написать падающий тест**
 
 ```python
-# backend/tests/engine/test_cv.py
-import json
+# backend/tests/engine/test_frames.py
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from tandemista.engine.cv import ClaudeVisionAnnotator
-from tandemista.engine.phases import PhaseName
+from tandemista.engine.frames import extract_frame_features
 
 
-class FakeMessages:
-    def __init__(self, payloads):
-        self.payloads = list(payloads)
-        self.calls = []
-
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        text = json.dumps(self.payloads.pop(0))
-
-        class Block:
-            def __init__(self, t):
-                self.text = t
-
-        class Resp:
-            content = [Block(text)]
-
-        return Resp()
-
-
-class FakeClient:
-    def __init__(self, payloads):
-        self.messages = FakeMessages(payloads)
+def lavfi_clip(path: Path, source: str, seconds: int) -> Path:
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error",
+         "-f", "lavfi", "-i", f"{source}:d={seconds}",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path)],
+        check=True, capture_output=True,
+    )
+    return path
 
 
 @pytest.fixture(scope="module")
-def tiny_clip(tmp_path_factory) -> Path:
-    out = tmp_path_factory.mktemp("cv") / "clip.mp4"
-    subprocess.run(
-        ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=4:size=320x240:rate=10",
-         "-c:v", "libx264", str(out)],
-        check=True, capture_output=True,
-    )
-    return out
-
-
-def test_annotate_merges_phases_and_moments(tiny_clip):
-    payload = {
-        "frames": [
-            {"t": 0, "phase": "climb", "emotion": 0.2, "notable": None},
-            {"t": 2, "phase": "freefall", "emotion": 0.9, "notable": "exit"},
-        ]
+def clips(tmp_path_factory) -> dict[str, Path]:
+    d = tmp_path_factory.mktemp("frames")
+    return {
+        "sky": lavfi_clip(d / "sky.mp4", "color=c=0x3399FF:s=640x360:r=10", 8),
+        "busy": lavfi_clip(d / "busy.mp4", "testsrc=s=640x360:r=10", 8),
     }
-    ann = ClaudeVisionAnnotator(client=FakeClient([payload]), fps=0.5).annotate(tiny_clip)
-    assert any(p.name == PhaseName.FREEFALL and p.source == "cv" for p in ann.phases)
-    assert any(m.kind == "exit" for m in ann.moments)
-    assert any(m.kind == "emotion" and m.score == 0.9 for m in ann.moments)
+
+
+def test_static_sky_clip_is_calm_flat_and_skylike(clips):
+    feats = extract_frame_features(clips["sky"], fps=1.0)
+    assert len(feats) >= 6
+    assert all(f.motion < 0.5 for f in feats[1:])       # nothing moves
+    assert all(f.sharpness < 5.0 for f in feats)        # flat colour has no edges
+    assert all(f.sky_ratio > 0.8 for f in feats)        # blue and bright
+    assert feats[0].motion == 0.0                       # no previous frame
+
+
+def test_moving_pattern_has_motion_and_detail(clips):
+    feats = extract_frame_features(clips["busy"], fps=1.0)
+    assert max(f.motion for f in feats) > 1.0
+    assert max(f.sharpness for f in feats) > 50.0
+    assert max(f.sky_ratio for f in feats) < 0.8        # test pattern is not sky
+
+
+def test_timestamps_follow_sampling_rate(clips):
+    feats = extract_frame_features(clips["sky"], fps=2.0)
+    assert feats[0].t == pytest.approx(0.0, abs=0.1)
+    assert feats[1].t == pytest.approx(0.5, abs=0.1)
+    assert feats[2].t == pytest.approx(1.0, abs=0.1)
+
+
+def test_missing_file_returns_empty(tmp_path):
+    assert extract_frame_features(tmp_path / "nope.mp4") == []
 ```
 
-- [ ] **Step 2: Убедиться, что падает** — FAIL (ModuleNotFoundError)
+- [ ] **Step 2: Запустить — убедиться, что падает**
+
+Run: `cd backend && pytest tests/engine/test_frames.py -q`
+Expected: FAIL (ModuleNotFoundError: tandemista.engine.frames)
 
 - [ ] **Step 3: Реализация**
+
+```python
+# backend/tandemista/engine/frames.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+SKY_MIN_BRIGHTNESS = 0.45
+FLOW_PYR_SCALE = 0.5
+FLOW_LEVELS = 3
+FLOW_WINSIZE = 15
+FLOW_ITERATIONS = 3
+FLOW_POLY_N = 5
+FLOW_POLY_SIGMA = 1.2
+
+
+@dataclass(frozen=True)
+class FrameFeatures:
+    """Weight-free visual measurements of one sampled frame."""
+
+    t: float
+    sharpness: float
+    motion: float
+    brightness: float
+    sky_ratio: float
+
+
+def _sky_ratio(bgr: np.ndarray) -> float:
+    b = bgr[:, :, 0].astype(np.int16)
+    r = bgr[:, :, 2].astype(np.int16)
+    value = bgr.max(axis=2).astype(np.float64) / 255.0
+    sky = (b >= r) & (value > SKY_MIN_BRIGHTNESS)
+    return float(sky.mean())
+
+
+def extract_frame_features(
+    video: Path, fps: float = 0.5, width: int = 320
+) -> list[FrameFeatures]:
+    """Sample the video at `fps` and measure each frame. No model weights involved."""
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        return []
+    try:
+        src_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        if src_fps <= 0:
+            src_fps = 30.0
+        stride = max(1, int(round(src_fps / fps)))
+        out: list[FrameFeatures] = []
+        prev_gray: np.ndarray | None = None
+        index = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if index % stride == 0:
+                scale = width / frame.shape[1]
+                small = cv2.resize(frame, (width, max(1, int(frame.shape[0] * scale))))
+                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                brightness = float(gray.mean()) / 255.0
+                motion = 0.0
+                if prev_gray is not None:
+                    flow = cv2.calcOpticalFlowFarneback(
+                        prev_gray, gray, None,
+                        FLOW_PYR_SCALE, FLOW_LEVELS, FLOW_WINSIZE,
+                        FLOW_ITERATIONS, FLOW_POLY_N, FLOW_POLY_SIGMA, 0,
+                    )
+                    motion = float(np.linalg.norm(flow, axis=2).mean())
+                out.append(
+                    FrameFeatures(
+                        t=index / src_fps,
+                        sharpness=sharpness,
+                        motion=motion,
+                        brightness=brightness,
+                        sky_ratio=_sky_ratio(small),
+                    )
+                )
+                prev_gray = gray
+            index += 1
+        return out
+    finally:
+        cap.release()
+```
+
+Также в `backend/pyproject.toml`: в `dependencies` заменить `"anthropic>=0.40"` на `"opencv-python-headless>=4.10"` (anthropic больше не используется нигде — CV перешёл на локальный конвейер).
+
+- [ ] **Step 4: Тесты зелёные**
+
+Run: `cd backend && pip install -e ".[dev]" -q && pytest tests/engine/test_frames.py -q`
+Expected: `4 passed`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/tandemista/engine/frames.py backend/tests/engine/test_frames.py backend/pyproject.toml
+git commit -m "feat: weight-free frame features (sharpness, optical flow, sky ratio)"
+```
+
+---
+
+### Task 8b: Локальный CV-аннотатор (замена адаптера Claude Vision)
+
+**Files:**
+- Rewrite: `backend/tandemista/engine/cv.py` (сохранить `Moment`, `CVAnnotation`, `CVAnnotator`; удалить `ClaudeVisionAnnotator` и весь код обращения к API; добавить `LocalCVAnnotator` и эвристики)
+- Rewrite: `backend/tests/engine/test_cv.py` (удалить fake-клиент Claude; тестировать эвристики на синтетических `FrameFeatures`)
+
+**Interfaces:**
+- Consumes: `FrameFeatures`, `extract_frame_features` (Task 8); `Phase`, `PhaseName` (Task 4).
+- Produces (имена сохраняются — Tasks 9, 10, 12 на них завязаны):
+  - `Moment(t: float, score: float, kind: str)` — kind: `"emotion" | "exit" | "deployment" | "scenic"`.
+  - `CVAnnotation(phases: list[Phase], moments: list[Moment])`.
+  - `CVAnnotator` Protocol с `annotate(video: Path) -> CVAnnotation`.
+  - `phases_from_features(feats: list[FrameFeatures]) -> list[Phase]` — фазы-эвристики, source `"cv"`, confidence 0.5 (ниже телеметрии и аудио: это догадка по картинке).
+  - `moments_from_features(feats: list[FrameFeatures]) -> list[Moment]` — момент `"exit"` в точке максимального прироста движения, `"deployment"` в точке максимального спада после него, `"scenic"` — до трёх самых резких кадров с большой долей неба вне пиков движения.
+  - `LocalCVAnnotator(fps: float = 0.5)` с `annotate(video)` — извлекает признаки и прогоняет обе эвристики. Task 12 конструирует его без аргументов.
+
+Пороговые значения — относительные (перцентили внутри файла), а не абсолютные: камеры и условия съёмки слишком разные, чтобы зашивать константы яркости и потока.
+
+- [ ] **Step 1: Написать падающий тест**
+
+```python
+# backend/tests/engine/test_cv.py
+from pathlib import Path
+
+from tandemista.engine.cv import (
+    CVAnnotation,
+    LocalCVAnnotator,
+    Moment,
+    moments_from_features,
+    phases_from_features,
+)
+from tandemista.engine.frames import FrameFeatures
+from tandemista.engine.phases import PhaseName
+
+
+def jump_features() -> list[FrameFeatures]:
+    """Ground interview, then boarding, then a violent freefall, canopy, landing."""
+    feats: list[FrameFeatures] = []
+
+    def add(n: int, motion: float, sky: float, sharp: float, bright: float = 0.5) -> None:
+        for _ in range(n):
+            t = len(feats) * 2.0
+            feats.append(FrameFeatures(t, sharp, motion, bright, sky))
+
+    add(10, motion=0.3, sky=0.05, sharp=60.0)    # interview on the ground
+    add(10, motion=0.6, sky=0.10, sharp=40.0)    # inside the plane
+    add(20, motion=9.0, sky=0.75, sharp=90.0)    # freefall: violent flow, lots of sky
+    add(20, motion=1.5, sky=0.60, sharp=80.0)    # under canopy: calm, still sky
+    add(10, motion=0.8, sky=0.10, sharp=70.0)    # landed
+    return feats
+
+
+def test_freefall_detected_from_flow_and_sky():
+    phases = phases_from_features(jump_features())
+    ff = next(p for p in phases if p.name == PhaseName.FREEFALL)
+    assert ff.source == "cv"
+    assert ff.confidence == 0.5
+    assert ff.start == 40.0            # frame 20 * 2s
+    assert ff.end == 80.0              # frame 40 * 2s
+    assert any(p.name == PhaseName.CANOPY for p in phases)
+
+
+def test_no_freefall_when_nothing_moves():
+    flat = [FrameFeatures(i * 2.0, 50.0, 0.2, 0.5, 0.1) for i in range(30)]
+    assert phases_from_features(flat) == []
+
+
+def test_exit_and_deployment_moments_bracket_the_freefall():
+    moments = moments_from_features(jump_features())
+    exit_m = next(m for m in moments if m.kind == "exit")
+    dep_m = next(m for m in moments if m.kind == "deployment")
+    assert exit_m.t == 40.0            # flow jumps here
+    assert dep_m.t == 80.0             # flow collapses here
+    assert dep_m.t > exit_m.t
+    assert any(m.kind == "scenic" for m in moments)
+
+
+def test_annotator_returns_annotation_for_a_real_clip(tmp_path):
+    import subprocess
+
+    clip = tmp_path / "clip.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+         "-i", "testsrc=s=320x180:r=10:d=6", "-c:v", "libx264",
+         "-pix_fmt", "yuv420p", str(clip)],
+        check=True, capture_output=True,
+    )
+    ann = LocalCVAnnotator(fps=1.0).annotate(clip)
+    assert isinstance(ann, CVAnnotation)
+    assert all(isinstance(m, Moment) for m in ann.moments)
+
+
+def test_annotator_satisfies_the_protocol():
+    from tandemista.engine.cv import CVAnnotator
+
+    annotator: CVAnnotator = LocalCVAnnotator()
+    assert callable(annotator.annotate)
+```
+
+- [ ] **Step 2: Запустить — убедиться, что падает**
+
+Run: `cd backend && pytest tests/engine/test_cv.py -q`
+Expected: FAIL (ImportError: LocalCVAnnotator / phases_from_features не существуют)
+
+- [ ] **Step 3: Реализация — полностью переписать `cv.py`**
 
 ```python
 # backend/tandemista/engine/cv.py
 from __future__ import annotations
 
-import base64
-import json
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .media import extract_frames
+from .frames import FrameFeatures, extract_frame_features
 from .phases import Phase, PhaseName
 
-PROMPT = (
-    "You are analyzing frames from a tandem skydive video. Frames are 1 per N seconds, "
-    "in order; the i-th image corresponds to t seconds given below. Return STRICT JSON "
-    '{"frames": [{"t": <sec>, "phase": "<interview|boarding|climb|exit|freefall|'
-    'deployment|canopy|landing|after>", "emotion": <0..1 how emotional/joyful the '
-    'passenger looks>, "notable": <null|"exit"|"deployment"|"scenic">}]}. No prose.'
-)
-
-BATCH = 20
-CV_CONFIDENCE = 0.7
-EMOTION_MIN = 0.6
+CV_CONFIDENCE = 0.5          # below telemetry (0.8-0.95) and audio (0.6): this is a guess from pixels
+FREEFALL_FLOW_PERCENTILE = 0.75
+FREEFALL_MIN_SKY = 0.35
+MIN_FREEFALL_FRAMES = 3
+CANOPY_MIN_SKY = 0.25
+MAX_SCENIC = 3
 
 
 @dataclass(frozen=True)
@@ -1045,79 +1247,111 @@ class CVAnnotator(Protocol):
     def annotate(self, video: Path) -> CVAnnotation: ...
 
 
-class ClaudeVisionAnnotator:
-    def __init__(self, client: object | None = None, model: str = "claude-sonnet-5", fps: float = 0.5):
-        if client is None:
-            import anthropic
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))
+    return ordered[idx]
 
-            client = anthropic.Anthropic()
-        self.client = client
-        self.model = model
+
+def _step(feats: list[FrameFeatures]) -> float:
+    return feats[1].t - feats[0].t if len(feats) > 1 else 1.0
+
+
+def phases_from_features(feats: list[FrameFeatures]) -> list[Phase]:
+    """Guess phases from motion and sky alone. Last-resort fallback: no telemetry, no audio."""
+    if len(feats) < MIN_FREEFALL_FRAMES + 1:
+        return []
+    flows = [f.motion for f in feats]
+    threshold = _percentile(flows, FREEFALL_FLOW_PERCENTILE)
+    if threshold <= 0.0:
+        return []
+    step = _step(feats)
+
+    # freefall: the longest run of high flow over open sky
+    best: tuple[int, int] | None = None
+    start: int | None = None
+    for i, f in enumerate(feats):
+        if f.motion >= threshold and f.sky_ratio >= FREEFALL_MIN_SKY:
+            start = i if start is None else start
+        elif start is not None:
+            if best is None or (i - start) > (best[1] - best[0]):
+                best = (start, i)
+            start = None
+    if start is not None and (best is None or (len(feats) - start) > (best[1] - best[0])):
+        best = (start, len(feats))
+    if best is None or (best[1] - best[0]) < MIN_FREEFALL_FRAMES:
+        return []
+
+    ff_start, ff_end = feats[best[0]].t, feats[best[1] - 1].t + step
+    phases = [
+        Phase(PhaseName.EXIT, ff_start, ff_start, CV_CONFIDENCE, "cv"),
+        Phase(PhaseName.FREEFALL, ff_start, ff_end, CV_CONFIDENCE, "cv"),
+        Phase(PhaseName.DEPLOYMENT, ff_end, ff_end, CV_CONFIDENCE, "cv"),
+    ]
+    if best[0] > 0:
+        phases.insert(0, Phase(PhaseName.CLIMB, feats[0].t, ff_start, CV_CONFIDENCE, "cv"))
+
+    # canopy: frames after freefall that still show sky
+    tail = [f for f in feats[best[1]:] if f.sky_ratio >= CANOPY_MIN_SKY]
+    if tail:
+        phases.append(
+            Phase(PhaseName.CANOPY, ff_end, tail[-1].t + step, CV_CONFIDENCE, "cv")
+        )
+        ground = [f for f in feats if f.t > tail[-1].t and f.sky_ratio < CANOPY_MIN_SKY]
+        if ground:
+            phases.append(
+                Phase(PhaseName.LANDING, ground[0].t, ground[-1].t + step, CV_CONFIDENCE, "cv")
+            )
+    return phases
+
+
+def moments_from_features(feats: list[FrameFeatures]) -> list[Moment]:
+    """Highlights that need no face model: the flow spike, the flow collapse, the pretty frames."""
+    if len(feats) < 3:
+        return []
+    moments: list[Moment] = []
+    deltas = [feats[i].motion - feats[i - 1].motion for i in range(1, len(feats))]
+    rise = max(range(len(deltas)), key=lambda i: deltas[i])
+    if deltas[rise] > 0:
+        moments.append(Moment(feats[rise + 1].t, 1.0, "exit"))
+        after = deltas[rise + 1:]
+        if after:
+            fall = rise + 1 + min(range(len(after)), key=lambda i: after[i])
+            if deltas[fall] < 0:
+                moments.append(Moment(feats[fall + 1].t, 1.0, "deployment"))
+
+    peak_flow = _percentile([f.motion for f in feats], FREEFALL_FLOW_PERCENTILE)
+    calm_and_pretty = [
+        f for f in feats if f.motion < peak_flow and f.sky_ratio >= CANOPY_MIN_SKY
+    ]
+    for f in sorted(calm_and_pretty, key=lambda f: -f.sharpness)[:MAX_SCENIC]:
+        moments.append(Moment(f.t, min(1.0, f.sharpness / 100.0), "scenic"))
+    return sorted(moments, key=lambda m: m.t)
+
+
+class LocalCVAnnotator:
+    """Own CV pipeline: OpenCV only, no model weights, no network, no LLM."""
+
+    def __init__(self, fps: float = 0.5):
         self.fps = fps
 
     def annotate(self, video: Path) -> CVAnnotation:
-        with tempfile.TemporaryDirectory() as td:
-            frames = extract_frames(video, Path(td), fps=self.fps)
-            step = 1.0 / self.fps
-            rows: list[dict] = []
-            for i in range(0, len(frames), BATCH):
-                batch = frames[i : i + BATCH]
-                times = [round((i + j) * step, 1) for j in range(len(batch))]
-                content: list[dict] = [
-                    {"type": "text", "text": f"{PROMPT}\nFrame times (s): {times}"}
-                ]
-                for f in batch:
-                    content.append(
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": base64.b64encode(f.read_bytes()).decode(),
-                            },
-                        }
-                    )
-                resp = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=2000,
-                    messages=[{"role": "user", "content": content}],
-                )
-                rows.extend(json.loads(resp.content[0].text)["frames"])
-        return CVAnnotation(self._merge_phases(rows), self._moments(rows))
-
-    def _merge_phases(self, rows: list[dict]) -> list[Phase]:
-        phases: list[Phase] = []
-        cur_name, cur_start, cur_end = None, 0.0, 0.0
-        step = 1.0 / self.fps
-        for r in rows:
-            name = r.get("phase")
-            if name == cur_name:
-                cur_end = r["t"] + step
-                continue
-            if cur_name is not None:
-                phases.append(Phase(PhaseName(cur_name), cur_start, cur_end, CV_CONFIDENCE, "cv"))
-            cur_name, cur_start, cur_end = name, r["t"], r["t"] + step
-        if cur_name is not None:
-            phases.append(Phase(PhaseName(cur_name), cur_start, cur_end, CV_CONFIDENCE, "cv"))
-        return phases
-
-    def _moments(self, rows: list[dict]) -> list[Moment]:
-        moments: list[Moment] = []
-        for r in rows:
-            if r.get("notable"):
-                moments.append(Moment(r["t"], 1.0, r["notable"]))
-            if (r.get("emotion") or 0) >= EMOTION_MIN:
-                moments.append(Moment(r["t"], r["emotion"], "emotion"))
-        return moments
+        feats = extract_frame_features(video, fps=self.fps)
+        return CVAnnotation(phases_from_features(feats), moments_from_features(feats))
 ```
 
-- [ ] **Step 4: Тесты зелёные** — `pytest tests/engine/test_cv.py -q` → `1 passed`
+- [ ] **Step 4: Тесты зелёные**
+
+Run: `cd backend && pytest tests/engine/test_cv.py -q && pytest -q`
+Expected: `5 passed` для файла; вся сюита зелёная (тестов Claude-адаптера больше нет).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add backend/tandemista/engine/cv.py backend/tests/engine/test_cv.py
-git commit -m "feat: CV annotator protocol with Claude vision adapter"
+git commit -m "feat: replace Claude vision adapter with local CV annotator"
 ```
 
 ---
@@ -1602,8 +1836,8 @@ git commit -m "feat: ffmpeg EDL renderer with 16:9 and 9:16 output"
 - Modify: `backend/pyproject.toml` (добавить `[project.scripts]`), `README.md` (раздел Usage)
 
 **Interfaces:**
-- Consumes: всё выше — `telemetry_from_gopro`, `extract_audio_rms`, `detect_phases_from_telemetry`, `detect_phases_from_audio`, `probe_duration`, `SourceFile`, `build_timeline`, `TEMPLATES`, `generate_edl`, `render_edl`, опционально `ClaudeVisionAnnotator`.
-- Produces: консольная команда `tandemista <jump_dir> --out <dir> [--height N] [--cv]`. Роли файлов — по префиксу имени: `interview_*` → ground_interview, `handcam_*` → handcam, `outside_*` → outside, `landing_*` → ground_landing (конвенция MVP; в облачном каркасе роли придут из Device). Смещения часов: interview ставится до прыжковых файлов, landing — после, по порядку (MVP: `interview=-3600`, прыжковые=0, `landing=+3600` — реальная синхронизация придёт с метчингом). Для каждого шаблона: если генерация упала (`SlotUnfillableError`) — пропустить вариант с warning, остальные рендерить. `--cv` включает `ClaudeVisionAnnotator` (нужен `ANTHROPIC_API_KEY`); без флага CV не вызывается.
+- Consumes: всё выше — `telemetry_from_gopro`, `extract_audio_rms`, `detect_phases_from_telemetry`, `detect_phases_from_audio`, `probe_duration`, `SourceFile`, `build_timeline`, `TEMPLATES`, `generate_edl`, `render_edl`, `LocalCVAnnotator`.
+- Produces: консольная команда `tandemista <jump_dir> --out <dir> [--height N] [--no-cv]`. Роли файлов — по префиксу имени: `interview_*` → ground_interview, `handcam_*` → handcam, `outside_*` → outside, `landing_*` → ground_landing (конвенция MVP; в облачном каркасе роли придут из Device). Смещения часов: interview ставится до прыжковых файлов, landing — после, по порядку (MVP: `interview=-3600`, прыжковые=0, `landing=+3600` — реальная синхронизация придёт с метчингом). Для каждого шаблона: если генерация упала (`SlotUnfillableError`) — пропустить вариант с warning, остальные рендерить. CV локальный и бесплатный, поэтому включён ВСЕГДА: он даёт моменты (`exit`/`deployment`/`scenic`) для наполнения слотов и фазы, когда нет ни телеметрии, ни аудио. Флаг `--no-cv` отключает его для отладки.
 
 - [ ] **Step 1: Падающий тест** (синтетические клипы; телеметрии нет, аудио сделаем «ветер» на нужном интервале — сработает audio-fallback)
 
@@ -1678,7 +1912,7 @@ ROLE_OFFSET = {"ground_interview": -3600.0, "handcam": 0.0, "outside": 0.0,
                "ground_landing": 3600.0}
 
 
-def analyze_file(path: Path, role: str, use_cv: bool) -> SourceFile:
+def analyze_file(path: Path, role: str, use_cv: bool = True) -> SourceFile:
     duration = probe_duration(path)
     phases = []
     if role in ("handcam", "outside"):
@@ -1689,9 +1923,9 @@ def analyze_file(path: Path, role: str, use_cv: bool) -> SourceFile:
             phases = detect_phases_from_audio(extract_audio_rms(path))
     moments = []
     if use_cv:
-        from .engine.cv import ClaudeVisionAnnotator
+        from .engine.cv import LocalCVAnnotator
 
-        ann = ClaudeVisionAnnotator().annotate(path)
+        ann = LocalCVAnnotator().annotate(path)
         moments = ann.moments
         if not phases:
             phases = ann.phases
@@ -1703,7 +1937,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("jump_dir", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--cv", action="store_true", help="use Claude vision annotator")
+    parser.add_argument("--no-cv", action="store_true", help="skip local CV analysis (debug)")
     args = parser.parse_args(argv)
 
     files: list[SourceFile] = []
@@ -1714,7 +1948,7 @@ def main(argv: list[str] | None = None) -> int:
         if role is None:
             print(f"skip (unknown role): {p.name}", file=sys.stderr)
             continue
-        files.append(analyze_file(p, role, args.cv))
+        files.append(analyze_file(p, role, use_cv=not args.no_cv))
     if not files:
         print("no recognizable files in jump_dir", file=sys.stderr)
         return 1
@@ -1748,7 +1982,7 @@ tandemista = "tandemista.cli:main"
 ## Usage (engine CLI)
     tandemista /path/to/jump_dir --out /tmp/cuts
     # file naming: interview_*.mp4, handcam_*.mp4, outside_*.mp4, landing_*.mp4
-    # --cv enables Claude vision highlights (needs ANTHROPIC_API_KEY)
+    # local CV runs always; --no-cv skips it for debugging
 ```
 
 - [ ] **Step 4: Все тесты зелёные**
@@ -1769,7 +2003,7 @@ git commit -m "feat: analyze-and-cut CLI wiring the full engine pipeline"
 
 1. `cd backend && pytest -q` — всё зелёное.
 2. Прогнать CLI на синтетике из `tests/test_cli.py` (fixture-папку можно собрать теми же ffmpeg-командами руками) — получить `full_16x9.mp4`, `emotions_16x9.mp4`, `highlights_9x16.mp4`, открыть глазами.
-3. Положить реальные файлы прыжка в папку с префиксами ролей, прогнать `tandemista <dir> --out cuts --cv` — проверить фазы и монтаж на настоящем материале (появление `backend/tests/samples/gopro.mp4` включит интеграционный тест GPMF).
+3. Положить реальные файлы прыжка в папку с префиксами ролей, прогнать `tandemista <dir> --out cuts` — проверить фазы и монтаж на настоящем материале (появление `backend/tests/samples/gopro.mp4` включит интеграционный тест GPMF).
 
 ## Отложено в следующие планы
 
@@ -1777,3 +2011,5 @@ git commit -m "feat: analyze-and-cut CLI wiring the full engine pipeline"
 - Аплоадер Tauri, автометчинг, clock_offset-калибровка (план 3).
 - Доставка, вотермарки, PaymentProvider (ЮKassa, Stripe) (план 4).
 - Музыка с даккингом, титры, кроп 9:16 по лицам (после пилотной обратной связи; заготовки — `Moment`, `aspect` в EDL).
+- **CV, слой с весами**: детекция лиц (YuNet ONNX, ~230 КБ) и мимика (MediaPipe Face Landmarker blendshapes, ~3.7 МБ) → моменты `"emotion"` и bbox лица для автокропа 9:16. Веса качает `backend/scripts/fetch_models.py` в `backend/models/` (в .gitignore), тесты — `skipif` при отсутствии. Отложено сознательно: сквозной конвейер должен сначала заработать целиком; эмоции — это качество выборки, а не блокер.
+- **CV, своя обученная модель**: разметку копим из правок оператора на экране ревью (подвинутая граница клипа = метка «здесь фаза начинается на самом деле», заменённый отрезок = метка «этот момент лучше»), затем обучаем классификатор фаз и скорер моментов и подставляем через тот же Protocol `CVAnnotator`. Отдельный план после пилота.
