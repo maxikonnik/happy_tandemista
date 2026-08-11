@@ -212,3 +212,34 @@ def test_overlap_with_gaps_in_consumed():
         for c2 in camera_clips[i+1:]:
             assert c1.src_out <= c2.src_in or c2.src_out <= c1.src_in, \
                 f"Clips from /camera.mp4 overlap: {c1} and {c2}"
+
+
+def test_emotions_ships_in_both_shapes():
+    """The emotions cut is delivered horizontally and vertically from one analysis."""
+    horizontal = TEMPLATES["emotions_16x9"]
+    vertical = TEMPLATES["emotions_9x16"]
+    assert horizontal.aspect == "16:9"
+    assert vertical.aspect == "9:16"
+    # Same story beats in both shapes, so the two variants stay recognisably one edit.
+    assert [s.phase for s in vertical.slots] == [s.phase for s in horizontal.slots]
+    assert [(s.min_s, s.max_s) for s in vertical.slots] == [
+        (s.min_s, s.max_s) for s in horizontal.slots
+    ]
+
+
+def test_vertical_emotions_prefers_the_face_camera_for_the_exit():
+    """A 9:16 crop of a wide outside shot loses the faces the emotions cut is about,
+    so the vertical variant reaches for the handcam first."""
+    vertical = TEMPLATES["emotions_9x16"]
+    exit_slot = next(s for s in vertical.slots if s.phase == PhaseName.EXIT)
+    assert exit_slot.prefer_roles[0] == "handcam"
+    assert exit_slot.required is True
+
+
+def test_vertical_emotions_generates_a_usable_edl():
+    edl = generate_edl(build_timeline(full_jump_files()), TEMPLATES["emotions_9x16"])
+    assert edl.variant == "emotions_9x16"
+    assert edl.aspect == "9:16"
+    assert edl.clips
+    for c in edl.clips:
+        assert c.src_out > c.src_in >= 0.0
