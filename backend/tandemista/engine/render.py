@@ -3,17 +3,27 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from .edl import EDL, Clip
-from .media import require_ffmpeg, has_audio, probe_duration
+from .edl import EDL
+from .media import require_ffmpeg, has_audio, probe_frame_rate, probe_audio_properties
 
 
-def render_edl(edl: EDL, out_path: Path, height: int = 720) -> Path:
+def render_edl(edl: EDL, out_path: Path, height: int = 720, fps: float | None = None) -> Path:
     require_ffmpeg()
     if not edl.clips:
         raise ValueError("EDL has no clips")
 
     # Round height to even number
     height = int(height / 2) * 2
+
+    # Determine target frame rate: use the highest frame rate from all clips,
+    # or fall back to 30fps if rates cannot be determined
+    if fps is None:
+        frame_rates = []
+        for c in edl.clips:
+            rate = probe_frame_rate(c.source)
+            if rate is not None:
+                frame_rates.append(rate)
+        fps = max(frame_rates) if frame_rates else 30.0
 
     # Calculate width based on aspect ratio, rounded to even number
     if edl.aspect == "9:16":
@@ -30,15 +40,18 @@ def render_edl(edl: EDL, out_path: Path, height: int = 720) -> Path:
 
         # Video processing: trim, reset timestamps, scale/crop, normalize
         if edl.aspect == "9:16":
-            # Center-crop to 9:16, but ensure crop width doesn't exceed input width
-            # crop=min(width, ih):ih would clip the crop width, so we use:
-            # crop=iw*9/16:ih (if iw is wider than ih*9/16)
-            # or crop=iw:iw*16/9 (if ih is taller than iw*16/9)
-            # Simplest: crop=min(iw, ih*9/16):min(ih, iw*16/9), but that's complex
-            # Better: crop=min(iw, ih*(9/16)):ih with center position
-            vscale = f"crop=min(iw\\,ih*9/16):ih,scale={width}:{height}"
+            # For 9:16 (vertical) output:
+            # 1. Crop to preserve 9:16 aspect (limited by input dimensions)
+            # 2. Scale to target height while preserving aspect
+            # 3. Pad with black bars to reach target width
+            # This preserves the source's proportions instead of stretching
+            vscale = (
+                f"crop=min(iw\\,ih*9/16):ih,"
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+            )
         else:
-            # 16:9: just scale to target dimensions
+            # 16:9: scale to target dimensions
             vscale = f"scale={width}:{height}"
 
         # Build video filter chain: trim + setpts + scale/crop + setsar + fps normalization
@@ -46,7 +59,7 @@ def render_edl(edl: EDL, out_path: Path, height: int = 720) -> Path:
 
         v_filter = (
             f"[{i}:v]trim=start={c.src_in}:end={c.src_out},setpts=PTS-STARTPTS,"
-            f"{vscale},setsar=1,fps=30[v{i}]"
+            f"{vscale},setsar=1,fps={fps}[v{i}]"
         )
         filters.append(v_filter)
 

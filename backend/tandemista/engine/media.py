@@ -36,6 +36,48 @@ def has_audio(path: Path) -> bool:
     return any(s.get("codec_type") == "audio" for s in streams)
 
 
+def probe_frame_rate(path: Path) -> float | None:
+    """Probe the frame rate of a video file. Returns None if not determinable."""
+    require_ffmpeg()
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate", str(path)],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout
+        data = json.loads(out)
+        if data.get("streams"):
+            r_frame_rate = data["streams"][0].get("r_frame_rate")
+            if r_frame_rate:
+                # r_frame_rate is a string like "30/1" or "60000/1001"
+                num, denom = map(int, r_frame_rate.split("/"))
+                return num / denom
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError, KeyError):
+        pass
+    return None
+
+
+def probe_audio_properties(path: Path) -> dict | None:
+    """Probe audio sample rate and channel layout. Returns None if no audio."""
+    require_ffmpeg()
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json", "-select_streams", "a:0",
+             "-show_entries", "stream=sample_rate,channels", str(path)],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout
+        data = json.loads(out)
+        if data.get("streams"):
+            stream = data["streams"][0]
+            return {
+                "sample_rate": int(stream.get("sample_rate", 0)),
+                "channels": int(stream.get("channels", 0)),
+            }
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError, KeyError):
+        pass
+    return None
+
+
 def extract_audio_rms(path: Path, step: float = 1.0) -> SignalSeries:
     require_ffmpeg()
     rate = 8000
