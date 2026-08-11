@@ -25,6 +25,17 @@ def probe_duration(path: Path) -> float:
     return float(json.loads(out)["format"]["duration"])
 
 
+def has_audio(path: Path) -> bool:
+    """Check if a media file has an audio stream."""
+    require_ffmpeg()
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", str(path)],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    streams = json.loads(out).get("streams", [])
+    return any(s.get("codec_type") == "audio" for s in streams)
+
+
 def extract_audio_rms(path: Path, step: float = 1.0) -> SignalSeries:
     require_ffmpeg()
     rate = 8000
