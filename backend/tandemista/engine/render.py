@@ -51,8 +51,15 @@ def render_edl(edl: EDL, out_path: Path, height: int = 720, fps: float | None = 
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
             )
         else:
-            # 16:9: scale to target dimensions
-            vscale = f"scale={width}:{height}"
+            # For 16:9 (landscape) output:
+            # 1. Scale to fit inside the target frame while preserving aspect
+            # 2. Pad with black bars to reach the exact target size
+            # Portrait phone interviews and 4:3 ground cameras get pillarboxed
+            # instead of stretched.
+            vscale = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+            )
 
         # Build video filter chain: trim + setpts + scale/crop + setsar + fps normalization
         has_audio_stream = has_audio(c.source)

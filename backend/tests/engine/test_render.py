@@ -1,6 +1,7 @@
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from tandemista.engine.edl import EDL, Clip
@@ -40,6 +41,46 @@ def make_clip_custom(path: Path, color: str, seconds: int, size: str, fps: str) 
         check=True, capture_output=True,
     )
     return path
+
+
+def make_clip_bands(path: Path, seconds: int, size: str, fps: str) -> Path:
+    """Create a clip with a wide green centre band flanked by red and blue edges.
+
+    Lets a test tell a centre crop (only green survives) apart from a stretch
+    (the red and blue edges survive, squashed).
+    """
+    w, h = (int(x) for x in size.split("x"))
+    edge = w // 5
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error",
+         "-f", "lavfi", "-i", f"color=c=green:s={size}:r={fps}:d={seconds}",
+         "-f", "lavfi", "-i", f"sine=frequency=220:duration={seconds}",
+         "-vf", f"drawbox=x=0:y=0:w={edge}:h={h}:color=red:t=fill,"
+                f"drawbox=x={w - edge}:y=0:w={edge}:h={h}:color=blue:t=fill",
+         "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path)],
+        check=True, capture_output=True,
+    )
+    return path
+
+
+def probe_dimensions(path: Path) -> tuple[int, int]:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip().split(",")
+    return int(probe[0]), int(probe[1])
+
+
+def first_frame_rgb(path: Path) -> np.ndarray:
+    """Decode the first frame as an (h, w, 3) uint8 RGB array."""
+    w, h = probe_dimensions(path)
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", "1",
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        check=True, capture_output=True,
+    ).stdout
+    return np.frombuffer(raw[: w * h * 3], dtype=np.uint8).reshape(h, w, 3)
 
 
 @pytest.fixture(scope="module")
@@ -179,39 +220,64 @@ def test_render_60fps_sources(tmp_path):
 
 
 def test_render_4to3_to_9x16_preserves_aspect(tmp_path):
-    """Test render of 4:3 source to 9:16 preserves aspect ratio instead of stretching.
+    """Render of a 4:3 source to 9:16 must centre-crop, never squash the full frame.
 
-    When a 4:3 (squarer) source is rendered to 9:16 (taller) output, it should be
-    letterboxed (pillarboxed vertically) rather than stretched. This is important
-    for ground-interview footage that is shot in landscape 4:3 or narrower.
+    A 4:3 (1.33) source is much wider than a 9:16 (0.5625) frame. The vertical
+    pipeline centre-crops to 9:16 first, so only the middle of the source survives.
+    A stretching implementation would instead squeeze the whole frame in, keeping
+    the left and right edges of the source visible - which is what this test rules
+    out by painting those edges red and blue and asserting they are gone.
     """
     d = tmp_path / "aspect_test"
     d.mkdir()
-    # Create a 4:3 aspect ratio source (400x300)
-    clip = make_clip_custom(d / "4to3.mp4", "blue", 2, "400x300", "30")
+    # 400x300 (4:3): red on the left fifth, blue on the right fifth, green between.
+    clip = make_clip_bands(d / "4to3.mp4", 2, "400x300", "30")
 
     edl = EDL("4to3_vertical", "9:16", [Clip(clip, 0.0, 2.0)])
     out = render_edl(edl, tmp_path / "4to3_vertical_out.mp4", height=720)
     assert out.exists()
 
-    # Verify output dimensions
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(out)],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip().split(",")
-    w, h = int(probe[0]), int(probe[1])
-
-    # Output should be 9:16 aspect ratio
+    w, h = probe_dimensions(out)
+    assert w % 2 == 0 and h % 2 == 0, f"dimensions must stay even, got {w}x{h}"
     assert abs(w / h - 9 / 16) < 0.02, f"Expected 9:16 aspect, got {w}x{h} = {w/h:.4f}"
 
-    # The source was 4:3 (1.33), narrower than 9:16 (0.5625).
-    # After center-crop to ~4:3 max, scale preserves that, then pad adds black bars.
-    # So visually, the 4:3 content should NOT be stretched to 9:16.
-    # We verify this by checking that if we scale the input to match output height,
-    # the width should be less than output width (meaning pillarboxing occurred).
-    # Input is 400x300 (4:3). If we scale to height 720, width should be 960.
-    # Output width is 404 (9:16 at 720h), much narrower, confirming letterboxing.
-    # Actually, let's verify by checking that the content isn't distorted:
-    # The filter applies crop=min(iw, ih*9/16) which for 400x300 is min(400, 168.75) = 168.75
-    # This is narrower than input, so content will be cropped not stretched.
+    frame = first_frame_rgb(out).astype(int)
+    r, g, b = frame[..., 0], frame[..., 1], frame[..., 2]
+    total = frame.shape[0] * frame.shape[1]
+    red_frac = float((r > g + 40).sum()) / total
+    blue_frac = float((b > g + 40).sum()) / total
+    # A stretch would keep ~20% red and ~20% blue; the centre crop keeps neither.
+    assert red_frac < 0.02, f"source left edge survived, {red_frac:.1%} red - frame was squashed"
+    assert blue_frac < 0.02, f"source right edge survived, {blue_frac:.1%} blue - frame was squashed"
+
+
+def test_render_portrait_to_16x9_preserves_aspect(tmp_path):
+    """Regression: the 16:9 path must pillarbox a portrait source, not stretch it.
+
+    A phone-shot portrait interview rendered into full_16x9 must keep its
+    proportions, with black padding on either side.
+    """
+    d = tmp_path / "portrait_test"
+    d.mkdir()
+    # 300x400 portrait source, solid blue so padding is distinguishable
+    clip = make_clip_custom(d / "portrait.mp4", "blue", 2, "300x400", "30")
+
+    edl = EDL("portrait_16x9", "16:9", [Clip(clip, 0.0, 2.0)])
+    out = render_edl(edl, tmp_path / "portrait_16x9_out.mp4", height=360)
+    assert out.exists()
+
+    w, h = probe_dimensions(out)
+    assert (w, h) == (640, 360), f"expected exactly 640x360, got {w}x{h}"
+
+    frame = first_frame_rgb(out).astype(int)
+    lit = frame.sum(axis=2).max(axis=0) > 60  # per column: does any pixel carry image?
+    assert not lit[0], "left edge should be black padding, not stretched image"
+    assert not lit[-1], "right edge should be black padding, not stretched image"
+
+    columns = np.flatnonzero(lit)
+    content_w = int(columns[-1] - columns[0] + 1)
+    # 300x400 scaled to height 360 must be ~270 wide; a stretch would fill all 640.
+    assert abs(content_w / h - 300 / 400) < 0.05, (
+        f"content is {content_w}x{h} (ratio {content_w / h:.3f}), "
+        f"expected source ratio 0.75 - image was stretched"
+    )
