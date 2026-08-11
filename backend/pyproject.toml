@@ -7,6 +7,9 @@ dependencies = ["numpy>=1.26", "opencv-python-headless>=4.10"]
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
+[project.scripts]
+tandemista = "tandemista.cli:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
