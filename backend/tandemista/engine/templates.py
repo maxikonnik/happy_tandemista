@@ -47,6 +47,20 @@ TEMPLATES: dict[str, Template] = {
             Slot(PhaseName.LANDING, 4, 8, prefer_roles=("ground_landing",)),
         ),
     ),
+    # Same beats and lengths as emotions_16x9, reframed vertically. The exit and
+    # freefall slots reach for the handcam first: a 9:16 crop of the outside
+    # operator's wide shot throws away the sides, and the faces are the point here.
+    "emotions_9x16": Template(
+        "emotions_9x16", "9:16",
+        (
+            Slot(PhaseName.INTERVIEW, 5, 10, prefer_roles=("ground_interview",)),
+            Slot(PhaseName.EXIT, 5, 13, required=True, lead_in=3, lead_out=10,
+                 prefer_roles=("handcam", "outside")),
+            Slot(PhaseName.FREEFALL, 15, 25, prefer_roles=("handcam", "outside")),
+            Slot(PhaseName.DEPLOYMENT, 3, 6, lead_out=4, prefer_roles=("handcam",)),
+            Slot(PhaseName.LANDING, 4, 8, prefer_roles=("ground_landing",)),
+        ),
+    ),
     "highlights_9x16": Template(
         "highlights_9x16", "9:16",
         (
