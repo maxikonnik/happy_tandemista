@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .engine.edl import SlotUnfillableError, generate_edl
 from .engine.gpmf import telemetry_from_gopro
-from .engine.media import extract_audio_rms, probe_duration
+from .engine.media import extract_audio_rms, has_audio, probe_duration
 from .engine.phases import detect_phases_from_audio, detect_phases_from_telemetry
 from .engine.render import render_edl
 from .engine.templates import TEMPLATES
@@ -30,7 +30,9 @@ def analyze_file(path: Path, role: str, use_cv: bool = True) -> SourceFile:
         telemetry = telemetry_from_gopro(path)
         if "vspeed_ms" in telemetry:
             phases = detect_phases_from_telemetry(telemetry["vspeed_ms"])
-        if not phases:
+        # Audio analysis is only a fallback; a mute camera is still usable footage,
+        # so let it fall through to CV instead of failing the whole file.
+        if not phases and has_audio(path):
             phases = detect_phases_from_audio(extract_audio_rms(path))
     moments = []
     if use_cv:
