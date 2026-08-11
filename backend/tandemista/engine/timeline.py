@@ -47,7 +47,9 @@ def build_timeline(files: list[SourceFile]) -> JumpTimeline:
             )
     for f in files:
         name = ROLE_PHASE.get(f.role)
-        if name is not None and name not in candidates:
+        if name is not None:
+            # Offer it like any other phase: SOURCE_RANK already encodes the policy,
+            # so a role phase beats a cv guess but yields to audio or telemetry.
             offer(
                 Phase(name, f.clock_offset, f.clock_offset + f.duration, 0.9, "role")
             )
