@@ -72,13 +72,14 @@ def generate_edl(timeline: JumpTimeline, template: Template) -> EDL:
         local_out = min(f.duration, local_in + length)
 
         # Trim to avoid overlaps with already-consumed intervals from the same file
+        # Resolve iteratively: each time local_in advances, recalculate local_out
         if f.path in consumed:
             for prev_in, prev_out in sorted(consumed[f.path]):
                 if local_in < prev_out and local_out > prev_in:
-                    # There's an overlap, move start forward
+                    # There's an overlap, move start forward past the consumed interval
                     local_in = max(local_in, prev_out)
-
-        local_out = min(f.duration, local_in + length)
+                    # Recalculate end to maintain the desired length
+                    local_out = min(f.duration, local_in + length)
 
         if local_out - local_in < 1.0:
             if slot.required:

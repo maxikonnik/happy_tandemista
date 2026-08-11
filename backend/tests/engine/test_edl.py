@@ -5,7 +5,7 @@ import pytest
 from tandemista.engine.cv import Moment
 from tandemista.engine.edl import SlotUnfillableError, generate_edl
 from tandemista.engine.phases import Phase, PhaseName
-from tandemista.engine.templates import TEMPLATES
+from tandemista.engine.templates import TEMPLATES, Slot, Template
 from tandemista.engine.timeline import SourceFile, build_timeline
 
 
@@ -113,3 +113,53 @@ def test_moment_with_nonzero_offset():
     # So FREEFALL is trimmed to start at 20.0: [20.0, 45.0]
     assert abs(ff_clip.src_in - 20.0) < 0.01, f"src_in should be ~20.0 after overlap trim, got {ff_clip.src_in}"
     assert abs(ff_clip.src_out - 45.0) < 0.01, f"src_out should be ~45.0, got {ff_clip.src_out}"
+
+
+def test_overlap_with_gaps_in_consumed():
+    """Regression: trimming must handle non-adjacent consumed intervals with gaps.
+
+    Without recalculating local_out in the trim loop, clips can still overlap consumed intervals.
+    Example: consumed [(5, 10), (12, 25)] with gap [10, 12]. A clip with local_in=0, length=6
+    (local_out=6) gets trimmed past [5,10] to local_in=10, but the stale local_out=6 means
+    the loop doesn't detect overlap with [12, 25]. Final clip becomes [10, 16], which overlaps [12, 25].
+    """
+    # Create phases that will produce consumed intervals with a gap
+    camera_phases = [
+        Phase(PhaseName.INTERVIEW, 5.0, 10.0, 0.9, "telemetry"),
+        Phase(PhaseName.CLIMB, 12.0, 25.0, 0.9, "telemetry"),
+        Phase(PhaseName.EXIT, 0.0, 20.0, 0.9, "telemetry"),
+    ]
+    files = [
+        SourceFile(Path("/camera.mp4"), "camera", 100.0, 0.0, camera_phases, []),
+    ]
+
+    # Custom template that produces consumed intervals with a gap
+    test_template = Template(
+        "gap_test", "16:9",
+        (
+            # Slot A: INTERVIEW [5, 10] with min=5, max=5 → [5, 10]
+            Slot(PhaseName.INTERVIEW, 5, 5, prefer_roles=("camera",)),
+            # Slot B: CLIMB [12, 25] with min=13, max=13 → [12, 25]
+            Slot(PhaseName.CLIMB, 13, 13, prefer_roles=("camera",)),
+            # Slot C: EXIT [0, 20] with min=6, max=6
+            # Initially: start=0, end=20, length=clamp(20, [6,6])=6
+            # local_in=0, local_out=6
+            # Trim past [5, 10]: local_in=10, but local_out still stale at 6
+            # Check vs [12, 25]: is 10 < 25 and 6 > 12? NO (6 not > 12)
+            # Loop exits without advancing further
+            # After loop: local_out = min(100, 10 + 6) = 16
+            # Result: [10, 16] which overlaps [12, 25]!
+            Slot(PhaseName.EXIT, 6, 6, prefer_roles=("camera",)),
+        ),
+    )
+
+    edl = generate_edl(build_timeline(files), test_template)
+
+    # Extract all clips from this camera
+    camera_clips = [c for c in edl.clips if c.source == Path("/camera.mp4")]
+
+    # Verify no two clips overlap (the bug would produce overlapping clips here)
+    for i, c1 in enumerate(camera_clips):
+        for c2 in camera_clips[i+1:]:
+            assert c1.src_out <= c2.src_in or c2.src_out <= c1.src_in, \
+                f"Clips from /camera.mp4 overlap: {c1} and {c2}"
