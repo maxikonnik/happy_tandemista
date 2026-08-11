@@ -111,8 +111,11 @@ def moments_from_features(feats: list[FrameFeatures]) -> list[Moment]:
     calm_and_pretty = [
         f for f in feats if f.motion < peak_flow and f.sky_ratio >= CANOPY_MIN_SKY
     ]
-    for f in sorted(calm_and_pretty, key=lambda f: -f.sharpness)[:MAX_SCENIC]:
-        moments.append(Moment(f.t, min(1.0, f.sharpness / 100.0), "scenic"))
+    candidates_sorted = sorted(calm_and_pretty, key=lambda f: -f.sharpness)[:MAX_SCENIC]
+    max_sharpness = max([f.sharpness for f in candidates_sorted]) if candidates_sorted else 0.0
+    for f in candidates_sorted:
+        score = f.sharpness / max_sharpness if max_sharpness > 0 else 0.0
+        moments.append(Moment(f.t, score, "scenic"))
     return sorted(moments, key=lambda m: m.t)
 
 

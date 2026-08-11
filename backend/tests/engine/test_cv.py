@@ -73,3 +73,48 @@ def test_annotator_satisfies_the_protocol():
 
     annotator: CVAnnotator = LocalCVAnnotator()
     assert callable(annotator.annotate)
+
+
+def scenic_candidates() -> list[FrameFeatures]:
+    """Multiple candidates for scenic moments with varying sharpness.
+
+    Regression test fixture: includes high-motion frames to set the percentile
+    threshold, then low-motion high-sky candidates with sharpness 4000, 400, 40.
+    Scores should vary by sharpness, not saturate to 1.0.
+    """
+    feats: list[FrameFeatures] = []
+    # High-motion frames to establish percentile
+    for i in range(5):
+        t = i * 2.0
+        feats.append(FrameFeatures(t, sharpness=50.0, motion=5.0, brightness=0.5, sky_ratio=0.05))
+    # Low-motion, high-sky candidates with different sharpness
+    for i, sharp in enumerate([4000.0, 400.0, 40.0]):
+        t = (5 + i) * 2.0
+        feats.append(FrameFeatures(t, sharpness=sharp, motion=0.1, brightness=0.5, sky_ratio=0.6))
+    return feats
+
+
+def test_scenic_scores_scale_with_sharpness_regression():
+    """Regression: scenic moments must discriminate by sharpness, not saturate.
+
+    With hardcoded 100.0 divisor, sharpness ~400+ clamps to 1.0, losing discrimination.
+    With relative (max-normalized) scoring, each candidate gets 0..1 range with the
+    sharpest scoring exactly 1.0.
+    """
+    moments = moments_from_features(scenic_candidates())
+    scenic = [m for m in moments if m.kind == "scenic"]
+
+    # Should have 3 scenic moments (top 3 by sharpness)
+    assert len(scenic) == 3, f"Expected 3 scenic moments, got {len(scenic)}"
+
+    # Fixture times are 10, 12, 14 (sharpness 4000, 400, 40).
+    # Scores should be strictly ordered: higher sharpness → higher score
+    assert scenic[0].score > scenic[1].score > scenic[2].score, \
+        f"Scores should be strictly decreasing with sharpness, got {[m.score for m in scenic]}"
+
+    # The sharpest frame should score exactly 1.0
+    assert scenic[0].score == 1.0, f"Sharpest frame should score 1.0, got {scenic[0].score}"
+
+    # None should exceed 1.0
+    assert all(m.score <= 1.0 for m in scenic), \
+        f"No score should exceed 1.0, got {[m.score for m in scenic]}"
