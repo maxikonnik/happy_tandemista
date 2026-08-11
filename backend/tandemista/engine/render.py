@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 from .edl import EDL
-from .media import require_ffmpeg, has_audio, probe_frame_rate, probe_audio_properties
+from .media import require_ffmpeg, has_audio, probe_frame_rate
 
 
 def render_edl(edl: EDL, out_path: Path, height: int = 720, fps: float | None = None) -> Path:

@@ -57,9 +57,10 @@ def generate_edl(timeline: JumpTimeline, template: Template) -> EDL:
             if slot.required:
                 raise SlotUnfillableError(slot)
             continue
-        start = phase.start - slot.lead_in
-        end = phase.end + slot.lead_out
-        length = min(max(end - start, slot.min_s), slot.max_s)
+        window_start = phase.start - slot.lead_in
+        window_end = phase.end + slot.lead_out
+        start = window_start
+        length = min(max(window_end - window_start, slot.min_s), slot.max_s)
         best = max(
             (m for m in f.moments
              if phase.start <= m.t + f.clock_offset <= phase.end),
@@ -67,6 +68,12 @@ def generate_edl(timeline: JumpTimeline, template: Template) -> EDL:
         )
         if best is not None:
             start = best.t + f.clock_offset - length / 2
+            # Centring looks for the best part INSIDE the slot's window, so keep the
+            # window there. Moments sitting on a phase boundary (the CV annotator
+            # scores "exit" 1.0 at the very first freefall frame) would otherwise
+            # drag the clip in front of the phase it is meant to show.
+            latest_start = max(window_start, window_end - length)
+            start = min(max(start, window_start), latest_start)
         # convert to file-local time and clamp to the file bounds
         local_in = max(0.0, start - f.clock_offset)
         local_out = min(f.duration, local_in + length)

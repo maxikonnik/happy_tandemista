@@ -1,4 +1,8 @@
+import inspect
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from tandemista.engine.cv import (
     CVAnnotation,
@@ -8,7 +12,7 @@ from tandemista.engine.cv import (
     phases_from_features,
 )
 from tandemista.engine.frames import FrameFeatures
-from tandemista.engine.phases import PhaseName
+from tandemista.engine.phases import Phase, PhaseName
 
 
 def jump_features() -> list[FrameFeatures]:
@@ -53,26 +57,51 @@ def test_exit_and_deployment_moments_bracket_the_freefall():
     assert any(m.kind == "scenic" for m in moments)
 
 
-def test_annotator_returns_annotation_for_a_real_clip(tmp_path):
-    import subprocess
-
-    clip = tmp_path / "clip.mp4"
+@pytest.fixture(scope="module")
+def real_clip(tmp_path_factory) -> Path:
+    clip = tmp_path_factory.mktemp("cv") / "clip.mp4"
     subprocess.run(
         ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
          "-i", "testsrc=s=320x180:r=10:d=6", "-c:v", "libx264",
          "-pix_fmt", "yuv420p", str(clip)],
         check=True, capture_output=True,
     )
-    ann = LocalCVAnnotator(fps=1.0).annotate(clip)
+    return clip
+
+
+def test_annotator_returns_annotation_for_a_real_clip(real_clip):
+    ann = LocalCVAnnotator(fps=1.0).annotate(real_clip)
     assert isinstance(ann, CVAnnotation)
     assert all(isinstance(m, Moment) for m in ann.moments)
 
 
-def test_annotator_satisfies_the_protocol():
+def test_annotator_satisfies_the_protocol(real_clip):
+    """CVAnnotator is a structural Protocol, so verify the shape it actually implies.
+
+    Asserting `callable(annotator.annotate)` cannot fail for any object that has the
+    attribute at all; what the Protocol really promises is the `annotate(video) ->
+    CVAnnotation` signature and an annotation carrying lists of Phase and Moment.
+    """
     from tandemista.engine.cv import CVAnnotator
 
-    annotator: CVAnnotator = LocalCVAnnotator()
-    assert callable(annotator.annotate)
+    annotator: CVAnnotator = LocalCVAnnotator(fps=1.0)
+
+    protocol_params = list(inspect.signature(CVAnnotator.annotate).parameters)
+    impl_params = list(inspect.signature(type(annotator).annotate).parameters)
+    assert impl_params == protocol_params, (
+        f"annotate signature drifted from the Protocol: {impl_params} != {protocol_params}"
+    )
+
+    ann = annotator.annotate(real_clip)
+    assert isinstance(ann, CVAnnotation)
+    assert isinstance(ann.phases, list)
+    assert all(isinstance(p, Phase) for p in ann.phases), (
+        f"phases must be Phase objects, got {[type(p).__name__ for p in ann.phases]}"
+    )
+    assert isinstance(ann.moments, list)
+    assert all(isinstance(m, Moment) for m in ann.moments), (
+        f"moments must be Moment objects, got {[type(m).__name__ for m in ann.moments]}"
+    )
 
 
 def scenic_candidates() -> list[FrameFeatures]:

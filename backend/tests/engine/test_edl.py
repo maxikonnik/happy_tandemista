@@ -41,6 +41,55 @@ def test_freefall_clip_centered_on_best_moment():
     assert any(c.src_in <= 320.0 <= c.src_out for c in ff)
 
 
+def multi_camera_files(moments):
+    """The normal multi-camera case: EXIT comes from the outside operator,
+    FREEFALL from the instructor's handcam, so no overlap trim hides a bad window."""
+    handcam_phases = [
+        Phase(PhaseName.EXIT, 300.0, 300.0, 0.9, "telemetry"),
+        Phase(PhaseName.FREEFALL, 300.0, 360.0, 0.9, "telemetry"),
+        Phase(PhaseName.DEPLOYMENT, 360.0, 360.0, 0.9, "telemetry"),
+    ]
+    return [
+        SourceFile(Path("/handcam.mp4"), "handcam", 400.0, 0.0, handcam_phases, moments),
+        SourceFile(Path("/outside.mp4"), "outside", 400.0, 0.0, [], []),
+    ]
+
+
+def test_freefall_clip_not_centred_before_the_phase_starts():
+    """Regression: a boundary moment must not drag the clip in front of its phase.
+
+    The CV annotator emits an "exit" moment with a fixed score of 1.0 at the very
+    first frame of freefall, so it always wins the centring contest. Centring on it
+    made the FREEFALL clip [ff_start - length/2, ff_start + length/2], i.e. half the
+    reel was in-plane footage labelled freefall.
+    """
+    files = multi_camera_files([Moment(300.0, 1.0, "exit"), Moment(330.0, 0.9, "scenic")])
+    edl = generate_edl(build_timeline(files), TEMPLATES["highlights_9x16"])
+
+    ff_clips = [c for c in edl.clips if c.source == Path("/handcam.mp4")]
+    assert len(ff_clips) == 1, f"expected one handcam clip (the freefall), got {ff_clips}"
+    ff = ff_clips[0]
+    assert ff.src_in >= 300.0, (
+        f"freefall clip starts at {ff.src_in}, before the freefall phase begins at 300.0"
+    )
+    assert ff.src_out <= 360.0, (
+        f"freefall clip ends at {ff.src_out}, past the freefall phase end 360.0"
+    )
+    # The exit itself must still come from the outside camera, as the template asks.
+    assert any(c.source == Path("/outside.mp4") for c in edl.clips)
+
+
+def test_interior_moment_still_recentres_the_clip():
+    """Guard: the fix must not disable moment centring for moments inside the phase."""
+    files = multi_camera_files([Moment(330.0, 1.0, "scenic")])
+    edl = generate_edl(build_timeline(files), TEMPLATES["highlights_9x16"])
+
+    ff = next(c for c in edl.clips if c.source == Path("/handcam.mp4"))
+    # highlights_9x16 FREEFALL slot: min 6, max 8 -> length 8, centred on t=330
+    assert ff.src_in == pytest.approx(326.0)
+    assert ff.src_out == pytest.approx(334.0)
+
+
 def test_required_slot_without_footage_raises():
     files = [SourceFile(Path("/interview.mp4"), "ground_interview", 90.0, 0.0, [], [])]
     with pytest.raises(SlotUnfillableError):
