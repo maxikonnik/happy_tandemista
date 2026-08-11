@@ -103,3 +103,34 @@ def detect_phases_from_telemetry(
     if land_t is not None:
         phases.append(Phase(PhaseName.LANDING, land_t, min(land_t + 15.0, s[-1].t), conf, "telemetry"))
     return phases
+
+
+WIND_RMS = 0.7
+MIN_FF_AUDIO_S = 20.0
+MAX_FF_AUDIO_S = 120.0
+
+
+def detect_phases_from_audio(rms: SignalSeries) -> list[Phase]:
+    s = rms.resample(1.0).samples
+    runs: list[tuple[float, float]] = []
+    start = None
+    for p in s:
+        if p.value >= WIND_RMS:
+            start = p.t if start is None else start
+        elif start is not None:
+            runs.append((start, p.t))
+            start = None
+    if start is not None:
+        runs.append((start, s[-1].t))
+    runs = [r for r in runs if MIN_FF_AUDIO_S <= r[1] - r[0] <= MAX_FF_AUDIO_S]
+    if not runs:
+        return []
+    ff_start, ff_end = max(runs, key=lambda r: r[1] - r[0])
+    conf = 0.6
+    return [
+        Phase(PhaseName.CLIMB, s[0].t, ff_start, conf, "audio"),
+        Phase(PhaseName.EXIT, ff_start, ff_start, conf, "audio"),
+        Phase(PhaseName.FREEFALL, ff_start, ff_end, conf, "audio"),
+        Phase(PhaseName.DEPLOYMENT, ff_end, ff_end, conf, "audio"),
+        Phase(PhaseName.CANOPY, ff_end, s[-1].t, conf, "audio"),
+    ]
