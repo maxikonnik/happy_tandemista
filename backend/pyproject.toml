@@ -2,7 +2,7 @@
 name = "tandemista"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["numpy>=1.26", "anthropic>=0.40"]
+dependencies = ["numpy>=1.26", "opencv-python-headless>=4.10"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
