@@ -8,7 +8,9 @@ Automatic collection, matching, editing and delivery of tandem skydive videos.
 ## Usage (engine CLI)
     tandemista /path/to/jump_dir --out /tmp/cuts
     # file naming: interview_*.mp4, handcam_*.mp4, outside_*.mp4, landing_*.mp4
+    # (also matches uppercase .MP4 extensions from GoPro cameras)
     # local CV runs always; --no-cv skips it for debugging
+    # Note: existing .mp4 files in --out directory will be overwritten
 
 ## Dev setup
     cd backend

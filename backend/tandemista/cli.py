@@ -46,20 +46,27 @@ def analyze_file(path: Path, role: str, use_cv: bool = True) -> SourceFile:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tandemista")
     parser.add_argument("jump_dir", type=Path)
-    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True,
+                       help="output directory (will overwrite existing .mp4 files)")
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--no-cv", action="store_true", help="skip local CV analysis (debug)")
     args = parser.parse_args(argv)
 
     files: list[SourceFile] = []
-    for p in sorted(args.jump_dir.glob("*.mp4")):
-        role = next(
-            (r for pref, r in ROLE_PREFIX.items() if p.name.startswith(pref)), None
-        )
-        if role is None:
-            print(f"skip (unknown role): {p.name}", file=sys.stderr)
-            continue
-        files.append(analyze_file(p, role, use_cv=not args.no_cv))
+    # Glob case-insensitively for *.mp4 and *.MP4 (GoPro cameras write uppercase)
+    for pattern in ("*.mp4", "*.MP4"):
+        for p in sorted(args.jump_dir.glob(pattern)):
+            role = next(
+                (r for pref, r in ROLE_PREFIX.items() if p.name.startswith(pref)), None
+            )
+            if role is None:
+                print(f"skip (unknown role): {p.name}", file=sys.stderr)
+                continue
+            try:
+                files.append(analyze_file(p, role, use_cv=not args.no_cv))
+            except Exception as e:
+                print(f"skip (corrupt/unreadable): {p.name}: {e}", file=sys.stderr)
+                continue
     if not files:
         print("no recognizable files in jump_dir", file=sys.stderr)
         return 1
@@ -72,9 +79,13 @@ def main(argv: list[str] | None = None) -> int:
         except SlotUnfillableError as e:
             print(f"warn: {name} skipped: {e}", file=sys.stderr)
             continue
-        out = render_edl(edl, args.out / f"{name}.mp4", height=args.height)
-        print(f"rendered {out}")
-        ok += 1
+        try:
+            out = render_edl(edl, args.out / f"{name}.mp4", height=args.height)
+            print(f"rendered {out}")
+            ok += 1
+        except Exception as e:
+            print(f"warn: {name} render failed: {e}", file=sys.stderr)
+            continue
     return 0 if ok else 1
 
 
