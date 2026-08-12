@@ -1,6 +1,9 @@
 import uuid
 
 import pytest
+from sqlalchemy import event
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from tandemista.config import Settings
 from tandemista.db.base import Base, configure_session, make_engine, SessionLocal
@@ -40,6 +43,38 @@ def test_analyze_media_missing_row(eager_db):
     from tandemista.worker.tasks import analyze_media
 
     assert analyze_media.run(str(uuid.uuid4())) == "missing"
+
+
+def test_analyze_media_recovers_on_broken_transaction(eager_db):
+    """I3: force a genuine IntegrityError while flushing the ANALYZED
+    status (by nulling out the NOT NULL `filename` column on the same
+    object right before flush). This leaves the SQLAlchemy session in the
+    real "transaction rolled back due to a previous exception during
+    flush" state -- the exact situation the except block must recover
+    from by rolling back before it re-fetches and commits FAILED.
+    """
+    from tandemista.worker.tasks import analyze_media
+
+    media_id = _make_media()
+
+    def _break_analyzed_write(session, flush_context, instances):
+        for obj in session.dirty:
+            if isinstance(obj, m.MediaFile) and obj.status == m.MediaStatus.ANALYZED:
+                obj.filename = None  # violates NOT NULL -> real IntegrityError
+
+    event.listen(Session, "before_flush", _break_analyzed_write)
+    try:
+        with pytest.raises(IntegrityError):
+            analyze_media.run(str(media_id))
+    finally:
+        event.remove(Session, "before_flush", _break_analyzed_write)
+
+    with SessionLocal() as s:
+        row = s.get(m.MediaFile, media_id)
+        assert row.status == m.MediaStatus.FAILED
+        # filename must be untouched: the FAILED write only refetched the
+        # row and set status; it never persisted the poisoned None value.
+        assert row.filename == "a.mp4"
 
 
 def test_celery_configured_eager_from_settings():

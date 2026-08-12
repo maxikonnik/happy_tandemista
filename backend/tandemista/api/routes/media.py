@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
@@ -28,9 +29,13 @@ def upload_media(
     if db.get(m.Dropzone, dropzone_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "dropzone not found")
 
+    filename = Path(file.filename).name if file.filename else "upload.bin"
+    if filename in ("", ".", ".."):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid filename")
+
     media_id = uuid.uuid4()
     content = file.file.read()
-    key = f"dropzones/{dropzone_id}/media/{media_id}/{file.filename}"
+    key = f"dropzones/{dropzone_id}/media/{media_id}/{filename}"
     stored = storage.put(key, io.BytesIO(content))
 
     media = m.MediaFile(
@@ -38,13 +43,19 @@ def upload_media(
         dropzone_id=dropzone_id,
         jump_id=jump_id,
         device_id=device_id,
-        filename=file.filename or "upload.bin",
+        filename=filename,
         locations=[stored.location],
         sha256=hashlib.sha256(content).hexdigest(),
         status=m.MediaStatus.REGISTERED,
     )
     db.add(media)
     db.flush()
+    # Commit BEFORE enqueueing: a real worker can dequeue and look the row up
+    # before this request's transaction would otherwise commit (in get_db,
+    # after the response). Without this, the row may not exist yet and the
+    # task silently no-ops (see analyze_media's `if media is None: return`).
+    # The trailing get_db() commit becomes a harmless no-op after this.
+    db.commit()
 
     from ...worker.tasks import analyze_media
 

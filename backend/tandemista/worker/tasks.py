@@ -26,6 +26,13 @@ def analyze_media(media_id: str) -> str:
             session.commit()
             return media.status.value
         except Exception:
-            media.status = m.MediaStatus.FAILED
-            session.commit()
+            # The transaction may already be broken by whatever raised above,
+            # so committing FAILED on it can itself raise and leave the row
+            # stuck in ANALYZING. Roll back first, then re-fetch on a clean
+            # transaction before recording the failure.
+            session.rollback()
+            media = session.get(m.MediaFile, media_id)
+            if media is not None:
+                media.status = m.MediaStatus.FAILED
+                session.commit()
             raise
