@@ -22,4 +22,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    from .routes import dropzones, jumps
+
+    app.include_router(dropzones.router)
+    app.include_router(jumps.router)
+
     return app
