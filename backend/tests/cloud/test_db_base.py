@@ -1,13 +1,17 @@
 import uuid
 
 from sqlalchemy import Column, String, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import DeclarativeBase, Session
 
 from tandemista.db.base import Base, configure_session, make_engine, make_session_factory
 from tandemista.db.types import GUID, JSONColumn
 
 
-class _Row(Base):
+class _TestBase(DeclarativeBase):
+    pass
+
+
+class _Row(_TestBase):
     __tablename__ = "t_row"
     id = Column(GUID, primary_key=True, default=uuid.uuid4)
     name = Column(String, nullable=False)
@@ -16,7 +20,7 @@ class _Row(Base):
 
 def test_guid_and_json_roundtrip_on_sqlite():
     engine = make_engine("sqlite+pysqlite:///:memory:")
-    Base.metadata.create_all(engine, tables=[_Row.__table__])
+    _TestBase.metadata.create_all(engine, tables=[_Row.__table__])
     factory = make_session_factory(engine)
     rid = uuid.uuid4()
     with factory() as s:  # type: Session
