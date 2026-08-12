@@ -7,3 +7,5 @@ node_modules/
 .next/
 dist/
 .superpowers/
+backend/.env
+backend/_storage/
