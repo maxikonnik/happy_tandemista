@@ -76,3 +76,12 @@ class JumpRead(_Read):
     customer_id: uuid.UUID | None
     load_id: uuid.UUID | None
     video_package: bool
+
+
+class MediaRead(_Read):
+    id: uuid.UUID
+    dropzone_id: uuid.UUID
+    jump_id: uuid.UUID | None
+    filename: str
+    status: str
+    locations: list
