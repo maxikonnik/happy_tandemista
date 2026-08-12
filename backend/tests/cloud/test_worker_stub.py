@@ -6,14 +6,6 @@ from tandemista.config import Settings
 from tandemista.db.base import Base, configure_session, make_engine, SessionLocal
 from tandemista.db import models as m
 
-# Import at module load (not inside the tests) so the worker module's
-# import-time `configure_session(...)` (bound to default settings) runs
-# before any fixture configures the DB session for a given test. Fixtures
-# then rebind SessionLocal last and win, matching real worker startup order
-# where the DB is migrated/available before tasks run against it.
-from tandemista.worker.tasks import analyze_media  # noqa: E402
-from tandemista.worker.celery_app import make_celery  # noqa: E402
-
 
 @pytest.fixture()
 def eager_db():
