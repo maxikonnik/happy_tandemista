@@ -12,6 +12,19 @@ Automatic collection, matching, editing and delivery of tandem skydive videos.
     # local CV runs always; --no-cv skips it for debugging
     # Note: existing .mp4 files in --out directory will be overwritten
 
+## Cloud backend (local dev)
+
+    cd backend
+    pip install -e ".[cloud,dev]"
+    cp .env.example .env            # adjust as needed
+    docker compose up -d            # postgres + redis + minio
+    alembic upgrade head            # create schema
+    uvicorn tandemista.api.app:create_app --factory --reload   # API on :8000
+    celery -A tandemista.worker.celery_app.celery worker -l info   # worker
+
+The manual upload endpoint is `POST /dropzones/{dropzone_id}/media` (multipart).
+Analysis currently runs a stub task; the real engine pipeline lands in a follow-up plan.
+
 ## Known limitations of this stage
 
 The engine is proven on synthetic footage only. Before pointing it at a real jump day,
